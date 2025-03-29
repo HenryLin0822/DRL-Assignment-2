@@ -242,15 +242,26 @@ def get_action(state, score):
     Returns:
         int: The best action (0: up, 1: down, 2: left, 3: right)
     """
+    import math
+    import numpy as np
+    import pickle
+    import copy
+    import sys
+    
+    # Fix numpy._core module issue for pickle loading
+    if not hasattr(np, '_core'):
+        np._core = np.core
+        sys.modules['numpy._core'] = np.core
+    
     # Define the N-Tuple Approximator class
     class NTupleApproximator:
         def __init__(self, board_size, patterns):
             """
-            Initializes the N-Tuple approximator.
+            Initializes the N-Tuple approximator without symmetry transformations.
             """
             self.board_size = board_size
             self.patterns = patterns
-            # Create default weight dictionaries (will be overwritten when loading weights)
+            # Create a weight dictionary for each pattern
             self.weights = [{} for _ in patterns]
             
         def tile_to_index(self, tile):
@@ -288,11 +299,15 @@ def get_action(state, score):
             for i, pattern in enumerate(self.patterns):
                 feature = self.get_feature(board, pattern)
                 
-                # Get weight for this feature (default to 0 if not found)
+                # Get weight for this feature
                 if feature in self.weights[i]:
                     total_value += self.weights[i][feature]
                     
             return total_value
+            
+        def load(self, weights_data):
+            """Load weights from provided data"""
+            self.weights = weights_data
     
     # Define the patterns to use (same as in the training code)
     patterns = [
@@ -320,93 +335,73 @@ def get_action(state, score):
         [(2,2), (2,3), (3,2), (3,3)]   # Bottom-right
     ]
     
-    # Since we can't load trained weights from a file in this context,
-    # we'll use a set of pre-defined heuristic weights that emphasize:
-    # 1. Keeping large values in corners
-    # 2. Maintaining monotonicity (increasing/decreasing sequences)
-    # 3. Keeping empty cells
-    
     # Create an approximator instance
     approximator = NTupleApproximator(board_size=4, patterns=patterns)
-    with open('improved_ntuple_weights.pkl', 'rb') as f:
-        weights_data = pickle.load(f)
-    approximator.load(weights_data)
-    # Define a simple heuristic evaluation function as a fallback
-    def heuristic_evaluation(board):
-        # Count empty cells (more is better)
-        empty_cells = np.sum(board == 0)
-        
-        # Reward high values in corners
-        corner_values = board[0,0] + board[0,3] + board[3,0] + board[3,3]
-        
-        # Calculate monotonicity (reward increasing/decreasing sequences)
-        monotonicity_score = 0
-        
-        # Check rows for monotonicity
-        for i in range(4):
-            # Left to right
-            for j in range(3):
-                if board[i,j] != 0 and board[i,j+1] != 0:
-                    if board[i,j] <= board[i,j+1]:
-                        monotonicity_score += 1
-            
-            # Right to left
-            for j in range(3, 0, -1):
-                if board[i,j] != 0 and board[i,j-1] != 0:
-                    if board[i,j] <= board[i,j-1]:
-                        monotonicity_score += 1
-        
-        # Check columns for monotonicity
-        for j in range(4):
-            # Top to bottom
-            for i in range(3):
-                if board[i,j] != 0 and board[i+1,j] != 0:
-                    if board[i,j] <= board[i+1,j]:
-                        monotonicity_score += 1
-            
-            # Bottom to top
-            for i in range(3, 0, -1):
-                if board[i,j] != 0 and board[i-1,j] != 0:
-                    if board[i,j] <= board[i-1,j]:
-                        monotonicity_score += 1
-        
-        # Combine the metrics
-        return empty_cells * 10 + corner_values + monotonicity_score * 2
     
-    # Set up the environment
-    env = Game2048Env()
-    env.board = state.copy()
+    # Load the weights safely
+    try:
+        with open('improved_ntuple_weights.pkl', 'rb') as f:
+            weights_data = pickle.load(f)
+        approximator.load(weights_data)
+    except Exception as e:
+        # If loading fails, try with encoding parameter
+        try:
+            with open('improved_ntuple_weights.pkl', 'rb') as f:
+                weights_data = pickle.load(f, encoding='latin1')
+            approximator.load(weights_data)
+        except Exception as e2:
+            # If still failing, use random action as last resort
+            print(f"Error loading model: {e2}")
+            import random
+            return random.choice([0, 1, 2, 3])
     
     # Find legal moves
-    legal_moves = [a for a in range(4) if env.is_move_legal(a)]
+    legal_moves = []
+    for action in range(4):
+        # Create a copy of the game to test if move is legal
+        test_board = state.copy()
+        env = Game2048Env()
+        env.board = test_board
+        if env.is_move_legal(action):
+            legal_moves.append(action)
     
     if not legal_moves:
-        # No legal moves, return any action (the game is over anyway)
+        # No legal moves, return any action
         return 0
     
     # Use after-states for action selection
     values = []
     for action in legal_moves:
         # Create a copy of the environment to simulate the action
-        sim_env = Game2048Env()
-        sim_env.board = state.copy()
+        env = Game2048Env()
+        env.board = state.copy()
         
         # Execute action without spawning a random tile
-        sim_env.step(action)
-        after_state = sim_env.board.copy()
+        if action == 0:
+            moved = env.move_up()
+        elif action == 1:
+            moved = env.move_down()
+        elif action == 2:
+            moved = env.move_left()
+        elif action == 3:
+            moved = env.move_right()
         
-        # Try to use the approximator's value function, but fall back to heuristic if needed
-        try:
-            state_value = approximator.value(after_state)
-        except:
-            # If something goes wrong with the approximator, use the heuristic
-            state_value = heuristic_evaluation(after_state)
+        # Skip invalid moves
+        if not moved:
+            continue
+            
+        after_state = env.board.copy()
         
+        # Get the value estimation for the resulting after-state
+        state_value = approximator.value(after_state)
         values.append((state_value, action))
     
+    if not values:
+        # If no moves were evaluated (shouldn't happen if legal_moves is correct)
+        return legal_moves[0]
+        
     # Choose the action with the highest estimated value
-    _, best_action = max(values)
+    values.sort(reverse=True)
+    best_value, best_action = values[0]
     
     return best_action
-
-
