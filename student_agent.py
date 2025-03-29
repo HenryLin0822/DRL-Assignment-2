@@ -328,7 +328,9 @@ def get_action(state, score):
     
     # Create an approximator instance
     approximator = NTupleApproximator(board_size=4, patterns=patterns)
-    
+    with open('improved_ntuple_weights.pkl', 'rb') as f:
+        weights_data = pickle.load(f)
+    approximator.load(weights_data)
     # Define a simple heuristic evaluation function as a fallback
     def heuristic_evaluation(board):
         # Count empty cells (more is better)
