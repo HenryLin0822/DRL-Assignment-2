@@ -231,6 +231,7 @@ class Game2048Env(gym.Env):
         # If the simulated board is different from the current board, the move is legal
         return not np.array_equal(self.board, temp_board)
 
+
 def get_action(state, score):
     """
     Uses an n-tuple network approximator to select the best action for the current game state.
@@ -242,17 +243,23 @@ def get_action(state, score):
     Returns:
         int: The best action (0: up, 1: down, 2: left, 3: right)
     """
-    # Define the N-Tuple Approximator class
+    import math
+    import copy
+    import numpy as np
+    import pickle
+    from collections import defaultdict
+    
+    # Define the NTupleApproximator class (must match training definition)
     class NTupleApproximator:
         def __init__(self, board_size, patterns):
             """
-            Initializes the N-Tuple approximator.
+            Initializes the N-Tuple approximator without symmetry transformations.
             """
             self.board_size = board_size
             self.patterns = patterns
-            # Create default weight dictionaries (will be overwritten when loading weights)
-            self.weights = [{} for _ in patterns]
-            
+            # Create a weight dictionary for each pattern
+            self.weights = [defaultdict(float) for _ in patterns]
+
         def tile_to_index(self, tile):
             """
             Converts tile values to an index for the lookup table.
@@ -261,11 +268,9 @@ def get_action(state, score):
                 return 0
             else:
                 return int(math.log(tile, 2))
-                
+
         def get_feature(self, board, coords):
-            """
-            Extract tile values from the board based on the given coordinates and convert them into a feature tuple.
-            """
+            # Extract tile values from the board based on the given coordinates and convert them into a feature tuple.
             feature = []
             for x, y in coords:
                 # Ensure coordinates are valid
@@ -274,31 +279,34 @@ def get_action(state, score):
                     index = self.tile_to_index(tile_value)
                     feature.append(index)
                 else:
+                    # Handle out-of-bounds coordinates (should not happen with properly generated patterns)
                     feature.append(0)
-                    
+
             return tuple(feature)
-            
+
         def value(self, board):
-            """
-            Estimate the value of a board position.
-            """
+            # Estimate the board value: sum the evaluations from all patterns.
             total_value = 0.0
-            
-            # Sum values from all patterns
+
+            # Sum values for each pattern
             for i, pattern in enumerate(self.patterns):
+                # Extract feature for this pattern
                 feature = self.get_feature(board, pattern)
-                
-                # Get weight for this feature (default to 0 if not found)
-                if feature in self.weights[i]:
-                    total_value += self.weights[i][feature]
-                    
+
+                # Add the weight for this feature
+                total_value += self.weights[i][feature]
+
+            # Normalize by number of patterns
+            total_value = total_value / len(self.patterns)
+
             return total_value
-        
+
         def load(self, filename):
             """Load weights from a file"""
             with open(filename, 'rb') as f:
                 self.weights = pickle.load(f)
-    # Define the patterns to use (same as in the training code)
+    
+    # Define the same patterns used during training
     patterns = [
         # All rows
         [(0,0), (0,1), (0,2), (0,3)],  # Row 0
@@ -324,88 +332,50 @@ def get_action(state, score):
         [(2,2), (2,3), (3,2), (3,3)]   # Bottom-right
     ]
     
-    # Since we can't load trained weights from a file in this context,
-    # we'll use a set of pre-defined heuristic weights that emphasize:
-    # 1. Keeping large values in corners
-    # 2. Maintaining monotonicity (increasing/decreasing sequences)
-    # 3. Keeping empty cells
-    
-    # Create an approximator instance
+    # Create and load the approximator
     approximator = NTupleApproximator(board_size=4, patterns=patterns)
-    model_path = 'improved_ntuple_weights.pkl'  # Update with your actual model path
-    approximator.load(model_path)
-    # Define a simple heuristic evaluation function as a fallback
-    def heuristic_evaluation(board):
-        # Count empty cells (more is better)
-        empty_cells = np.sum(board == 0)
-        
-        # Reward high values in corners
-        corner_values = board[0,0] + board[0,3] + board[3,0] + board[3,3]
-        
-        # Calculate monotonicity (reward increasing/decreasing sequences)
-        monotonicity_score = 0
-        
-        # Check rows for monotonicity
-        for i in range(4):
-            # Left to right
-            for j in range(3):
-                if board[i,j] != 0 and board[i,j+1] != 0:
-                    if board[i,j] <= board[i,j+1]:
-                        monotonicity_score += 1
-            
-            # Right to left
-            for j in range(3, 0, -1):
-                if board[i,j] != 0 and board[i,j-1] != 0:
-                    if board[i,j] <= board[i,j-1]:
-                        monotonicity_score += 1
-        
-        # Check columns for monotonicity
-        for j in range(4):
-            # Top to bottom
-            for i in range(3):
-                if board[i,j] != 0 and board[i+1,j] != 0:
-                    if board[i,j] <= board[i+1,j]:
-                        monotonicity_score += 1
-            
-            # Bottom to top
-            for i in range(3, 0, -1):
-                if board[i,j] != 0 and board[i-1,j] != 0:
-                    if board[i,j] <= board[i-1,j]:
-                        monotonicity_score += 1
-        
-        # Combine the metrics
-        return empty_cells * 10 + corner_values + monotonicity_score * 2
     
-    # Set up the environment
+    model_path = 'improved_ntuple_weights.pkl'
+    approximator.load(model_path)
+
+    
+    # Create a temporary environment to check legal moves and simulate actions
     env = Game2048Env()
     env.board = state.copy()
     
     # Find legal moves
     legal_moves = [a for a in range(4) if env.is_move_legal(a)]
-    
     if not legal_moves:
-        # No legal moves, return any action (the game is over anyway)
-        return 0
+        return 0  # No legal moves, return any action (game is over)
     
-    # Use after-states for action selection
+    # Use after-states for action selection, matching the training approach
     values = []
     for action in legal_moves:
         # Create a copy of the environment to simulate the action
-        sim_env = Game2048Env()
-        sim_env.board = state.copy()
+        sim_env = copy.deepcopy(env)
         
         # Execute action without spawning a random tile
-        sim_env.step(action)
+        if action == 0:
+            moved = sim_env.move_up()
+        elif action == 1:
+            moved = sim_env.move_down()
+        elif action == 2:
+            moved = sim_env.move_left()
+        elif action == 3:
+            moved = sim_env.move_right()
+            
+        if not moved:
+            continue
+            
         after_state = sim_env.board.copy()
-        
-        # Try to use the approximator's value function, but fall back to heuristic if needed
-        try:
-            state_value = approximator.value(after_state)
-        except:
-            # If something goes wrong with the approximator, use the heuristic
-            state_value = heuristic_evaluation(after_state)
-        
+
+        # Get the value estimation for the resulting after-state
+        state_value = approximator.value(after_state)
         values.append((state_value, action))
+    
+    if not values:
+        # Shouldn't happen if legal_moves is correct, but just in case
+        return legal_moves[0]
     
     # Choose the action with the highest estimated value
     _, best_action = max(values)
