@@ -337,7 +337,7 @@ def get_action(state, score):
     # Create and load the approximator
     approximator = NTupleApproximator(board_size=4, patterns=patterns)
     
-    model_path = 'improved_ntuple_weights.pkl'
+    model_path = 'ntuple_weights.pkl'
     approximator.load(model_path)
 
     
