@@ -370,6 +370,7 @@ def get_action(state, score):
     Returns:
         int: The best action (0: up, 1: down, 2: left, 3: right)
     """
+    print("1")
     global _GLOBAL_APPROXIMATOR
     
     # Initialize the approximator if it's not already loaded
