@@ -1,14 +1,24 @@
-# Remember to adjust your student ID in meta.xml
+import math
 import numpy as np
 import pickle
 import random
 import gym
 from gym import spaces
 import matplotlib.pyplot as plt
-import copy
-import random
-import math
+from collections import defaultdict
 
+# Color maps for visualization
+COLOR_MAP = {
+    0: "#cdc1b4", 2: "#eee4da", 4: "#ede0c8", 8: "#f2b179",
+    16: "#f59563", 32: "#f67c5f", 64: "#f65e3b", 128: "#edcf72",
+    256: "#edcc61", 512: "#edc850", 1024: "#edc53f", 2048: "#edc22e",
+    4096: "#3c3a32", 8192: "#3c3a32", 16384: "#3c3a32", 32768: "#3c3a32"
+}
+TEXT_COLOR = {
+    2: "#776e65", 4: "#776e65", 8: "#f9f6f2", 16: "#f9f6f2",
+    32: "#f9f6f2", 64: "#f9f6f2", 128: "#f9f6f2", 256: "#f9f6f2",
+    512: "#f9f6f2", 1024: "#f9f6f2", 2048: "#f9f6f2", 4096: "#f9f6f2"
+}
 
 class Game2048Env(gym.Env):
     def __init__(self):
@@ -232,116 +242,159 @@ class Game2048Env(gym.Env):
         return not np.array_equal(self.board, temp_board)
 
 
+# Global approximator to avoid recreating it on every get_action call
+_GLOBAL_APPROXIMATOR = None
+
+class SymmetricNTupleApproximator:
+    def __init__(self, board_size, patterns):
+        """
+        Initializes the N-Tuple approximator with symmetry transformations.
+        """
+        self.board_size = board_size
+        self.base_patterns = patterns
+        # Create a weight dictionary for each pattern
+        self.weights = [defaultdict(float) for _ in patterns]
+        
+        # Define all symmetry transformations
+        self.transformations = [
+            lambda c: c,                              # identity
+            lambda c: self._rot90(c),                 # 90 degrees
+            lambda c: self._rot180(c),                # 180 degrees
+            lambda c: self._rot270(c),                # 270 degrees
+            lambda c: self._flip_h(c),                # horizontal flip
+            lambda c: self._flip_v(c),                # vertical flip
+            lambda c: self._flip_d1(c),               # diagonal flip (TL-BR)
+            lambda c: self._flip_d2(c),               # diagonal flip (TR-BL)
+        ]
+    
+    # Transformation methods defined as instance methods to avoid board_size parameter
+    def _rot90(self, coord):
+        """Rotate coordinates 90 degrees clockwise"""
+        x, y = coord
+        return (y, self.board_size - 1 - x)
+
+    def _rot180(self, coord):
+        """Rotate coordinates 180 degrees"""
+        x, y = coord
+        return (self.board_size - 1 - x, self.board_size - 1 - y)
+
+    def _rot270(self, coord):
+        """Rotate coordinates 270 degrees clockwise"""
+        x, y = coord
+        return (self.board_size - 1 - y, x)
+
+    def _flip_h(self, coord):
+        """Horizontal flip"""
+        x, y = coord
+        return (x, self.board_size - 1 - y)
+
+    def _flip_v(self, coord):
+        """Vertical flip"""
+        x, y = coord
+        return (self.board_size - 1 - x, y)
+
+    def _flip_d1(self, coord):
+        """Diagonal flip (top-left to bottom-right)"""
+        x, y = coord
+        return (y, x)
+
+    def _flip_d2(self, coord):
+        """Diagonal flip (top-right to bottom-left)"""
+        x, y = coord
+        return (self.board_size - 1 - y, self.board_size - 1 - x)
+
+    def tile_to_index(self, tile):
+        """
+        Converts tile values to an index for the lookup table.
+        """
+        if tile == 0:
+            return 0
+        else:
+            return int(math.log(tile, 2))
+
+    def get_feature(self, board, coords, transform_func):
+        # Extract tile values from the board based on the transformed coordinates
+        feature = []
+        for coord in coords:
+            # Apply the transformation to the coordinate
+            x, y = transform_func(coord)
+            
+            # Ensure coordinates are valid
+            if 0 <= x < self.board_size and 0 <= y < self.board_size:
+                tile_value = board[x, y]
+                index = self.tile_to_index(tile_value)
+                feature.append(index)
+            else:
+                # Handle out-of-bounds coordinates
+                feature.append(0)
+
+        return tuple(feature)
+
+    def value(self, board):
+        # Estimate the board value using all symmetric transformations
+        total_value = 0.0
+        num_features = 0
+
+        # For each base pattern
+        for i, pattern in enumerate(self.base_patterns):
+            # For each transformation
+            for transform_func in self.transformations:
+                # Extract feature for this pattern with this transformation
+                feature = self.get_feature(board, pattern, transform_func)
+                
+                # Add the weight for this feature
+                total_value += self.weights[i][feature]
+                num_features += 1
+
+        # Normalize by total number of features
+        total_value = total_value / num_features
+
+        return total_value
+
+    def load(self, filename):
+        """Load weights from a file"""
+        with open(filename, 'rb') as f:
+            self.weights = pickle.load(f)
+
+
 def get_action(state, score):
     """
-    Uses an n-tuple network approximator to select the best action for the current game state.
+    Uses a symmetric n-tuple network approximator to select the best action.
+    Maintains a global approximator to avoid reloading the model each time.
+    Takes into account both immediate rewards and future board value.
     
     Args:
         state: The current board state (4x4 numpy array)
-        score: The current score (unused in this implementation)
+        score: The current score (used to calculate immediate rewards)
         
     Returns:
         int: The best action (0: up, 1: down, 2: left, 3: right)
     """
-    import math
-    import copy
-    import numpy as np
-    import pickle
-    from collections import defaultdict
+    global _GLOBAL_APPROXIMATOR
     
-    # Define the NTupleApproximator class (must match training definition)
-    class NTupleApproximator:
-        def __init__(self, board_size, patterns):
-            """
-            Initializes the N-Tuple approximator without symmetry transformations.
-            """
-            self.board_size = board_size
-            self.patterns = patterns
-            # Create a weight dictionary for each pattern
-            self.weights = [defaultdict(float) for _ in patterns]
-
-        def tile_to_index(self, tile):
-            """
-            Converts tile values to an index for the lookup table.
-            """
-            if tile == 0:
-                return 0
-            else:
-                return int(math.log(tile, 2))
-
-        def get_feature(self, board, coords):
-            # Extract tile values from the board based on the given coordinates and convert them into a feature tuple.
-            feature = []
-            for x, y in coords:
-                # Ensure coordinates are valid
-                if 0 <= x < self.board_size and 0 <= y < self.board_size:
-                    tile_value = board[x, y]
-                    index = self.tile_to_index(tile_value)
-                    feature.append(index)
-                else:
-                    # Handle out-of-bounds coordinates (should not happen with properly generated patterns)
-                    feature.append(0)
-
-            return tuple(feature)
-
-        def value(self, board):
-            # Estimate the board value: sum the evaluations from all patterns.
-            total_value = 0.0
-
-            # Sum values for each pattern
-            for i, pattern in enumerate(self.patterns):
-                # Extract feature for this pattern
-                feature = self.get_feature(board, pattern)
-
-                # Add the weight for this feature
-                total_value += self.weights[i][feature]
-
-            # Normalize by number of patterns
-            total_value = total_value / len(self.patterns)
-
-            return total_value
-
-        def load(self, filename):
-            """Load weights from a file"""
-            with open(filename, 'rb') as f:
-                self.weights = pickle.load(f)
+    # Initialize the approximator if it's not already loaded
+    if _GLOBAL_APPROXIMATOR is None:
+        # Define the same patterns used during training
+        patterns = [
+            #row
+            [(0,0), (0,1), (0,2), (0,3)],
+            [(1,0), (1,1), (1,2), (1,3)],
+            #2*2
+            [(0,0),(0,1),(1,0),(1,1)],
+            [(1,0),(1,1),(2,0),(2,1)],
+            #6-tuple patterns
+            [(0,0), (0,1), (0,2), (0,3), (1,0), (1,1)],
+            [(0,0), (0,1), (1,0), (1,1), (1,2), (1,3)],
+            [(0,0), (0,1), (0,2), (1,0), (1,1), (1,2)],
+            [(0,1), (0,2), (1,1), (1,2), (2,1), (2,2)],
+            [(0,0), (0,1), (0,2), (0,3), (1,0), (1,2)],
+        ]
+        
+        # Create and load the approximator
+        _GLOBAL_APPROXIMATOR = SymmetricNTupleApproximator(board_size=4, patterns=patterns)
+        _GLOBAL_APPROXIMATOR.load('ntuple_weights75000.pkl')
     
-    import sys
-    sys.modules['__main__'].NTupleApproximator = NTupleApproximator
-    # Define the same patterns used during training
-    patterns = [
-        # All rows
-        [(0,0), (0,1), (0,2), (0,3)],  # Row 0
-        [(1,0), (1,1), (1,2), (1,3)],  # Row 1
-        [(2,0), (2,1), (2,2), (2,3)],  # Row 2
-        [(3,0), (3,1), (3,2), (3,3)],  # Row 3
-
-        # All columns
-        [(0,0), (1,0), (2,0), (3,0)],  # Column 0
-        [(0,1), (1,1), (2,1), (3,1)],  # Column 1
-        [(0,2), (1,2), (2,2), (3,2)],  # Column 2
-        [(0,3), (1,3), (2,3), (3,3)],  # Column 3
-
-        # All 2×2 squares
-        [(0,0), (0,1), (1,0), (1,1)],  # Top-left
-        [(0,1), (0,2), (1,1), (1,2)],  # Top-middle-left
-        [(0,2), (0,3), (1,2), (1,3)],  # Top-middle-right
-        [(1,0), (1,1), (2,0), (2,1)],  # Middle-left
-        [(1,1), (1,2), (2,1), (2,2)],  # Middle-center
-        [(1,2), (1,3), (2,2), (2,3)],  # Middle-right
-        [(2,0), (2,1), (3,0), (3,1)],  # Bottom-left
-        [(2,1), (2,2), (3,1), (3,2)],  # Bottom-middle-left
-        [(2,2), (2,3), (3,2), (3,3)]   # Bottom-right
-    ]
-    
-    # Create and load the approximator
-    approximator = NTupleApproximator(board_size=4, patterns=patterns)
-    
-    model_path = 'ntuple_weights.pkl'
-    approximator.load(model_path)
-
-    
-    # Create a temporary environment to check legal moves and simulate actions
+    # Create a temporary environment to check legal moves
     env = Game2048Env()
     env.board = state.copy()
     
@@ -350,38 +403,109 @@ def get_action(state, score):
     if not legal_moves:
         return 0  # No legal moves, return any action (game is over)
     
-    # Use after-states for action selection, matching the training approach
+    # Gamma value used in training (discount factor)
+    gamma = 1.0
+    
+    # Evaluate each legal move
     values = []
     for action in legal_moves:
-        # Create a copy of the environment to simulate the action
-        sim_env = copy.deepcopy(env)
+        # Simulate the move and calculate immediate reward
+        board_copy = state.copy()
+        immediate_reward = 0
         
-        # Execute action without spawning a random tile
-        if action == 0:
-            moved = sim_env.move_up()
-        elif action == 1:
-            moved = sim_env.move_down()
-        elif action == 2:
-            moved = sim_env.move_left()
-        elif action == 3:
-            moved = sim_env.move_right()
-            
-        if not moved:
-            continue
-            
-        after_state = sim_env.board.copy()
-
-        # Get the value estimation for the resulting after-state
-        state_value = approximator.value(after_state)
-        values.append((state_value, action))
+        if action == 0:  # Up
+            for j in range(4):
+                col = board_copy[:, j].copy()
+                # Compress (remove zeros)
+                new_col = col[col != 0]
+                new_col = np.pad(new_col, (0, 4 - len(new_col)), mode='constant')
+                
+                # Merge
+                for i in range(3):
+                    if new_col[i] != 0 and new_col[i] == new_col[i+1]:
+                        new_col[i] *= 2
+                        immediate_reward += new_col[i]  # Add to reward
+                        new_col[i+1] = 0
+                
+                # Compress again
+                new_col = new_col[new_col != 0]
+                new_col = np.pad(new_col, (0, 4 - len(new_col)), mode='constant')
+                
+                # Update board
+                board_copy[:, j] = new_col
+                
+        elif action == 1:  # Down
+            for j in range(4):
+                col = board_copy[:, j].copy()
+                # Reverse, compress, merge, compress, reverse back
+                col = col[::-1]
+                new_col = col[col != 0]
+                new_col = np.pad(new_col, (0, 4 - len(new_col)), mode='constant')
+                
+                for i in range(3):
+                    if new_col[i] != 0 and new_col[i] == new_col[i+1]:
+                        new_col[i] *= 2
+                        immediate_reward += new_col[i]
+                        new_col[i+1] = 0
+                
+                new_col = new_col[new_col != 0]
+                new_col = np.pad(new_col, (0, 4 - len(new_col)), mode='constant')
+                
+                # Reverse back and update
+                board_copy[:, j] = new_col[::-1]
+                
+        elif action == 2:  # Left
+            for i in range(4):
+                row = board_copy[i].copy()
+                # Compress
+                new_row = row[row != 0]
+                new_row = np.pad(new_row, (0, 4 - len(new_row)), mode='constant')
+                
+                # Merge
+                for j in range(3):
+                    if new_row[j] != 0 and new_row[j] == new_row[j+1]:
+                        new_row[j] *= 2
+                        immediate_reward += new_row[j]
+                        new_row[j+1] = 0
+                
+                # Compress again
+                new_row = new_row[new_row != 0]
+                new_row = np.pad(new_row, (0, 4 - len(new_row)), mode='constant')
+                
+                # Update board
+                board_copy[i] = new_row
+                
+        elif action == 3:  # Right
+            for i in range(4):
+                row = board_copy[i].copy()
+                # Reverse, compress, merge, compress, reverse back
+                row = row[::-1]
+                new_row = row[row != 0]
+                new_row = np.pad(new_row, (0, 4 - len(new_row)), mode='constant')
+                
+                for j in range(3):
+                    if new_row[j] != 0 and new_row[j] == new_row[j+1]:
+                        new_row[j] *= 2
+                        immediate_reward += new_row[j]
+                        new_row[j+1] = 0
+                
+                new_row = new_row[new_row != 0]
+                new_row = np.pad(new_row, (0, 4 - len(new_row)), mode='constant')
+                
+                # Reverse back and update
+                board_copy[i] = new_row[::-1]
+        
+        # Calculate future value
+        future_value = _GLOBAL_APPROXIMATOR.value(board_copy)
+        
+        # Combine immediate reward and future value
+        action_value = immediate_reward + gamma * future_value
+        values.append((action_value, action))
     
+    # If no valid moves, return any action (game should be over)
     if not values:
-        # Shouldn't happen if legal_moves is correct, but just in case
         return legal_moves[0]
     
-    # Choose the action with the highest estimated value
+    # Return the action with the highest value
     _, best_action = max(values)
-    
     return best_action
-
-
