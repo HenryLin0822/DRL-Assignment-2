@@ -370,7 +370,7 @@ def get_action(state, score):
     Returns:
         int: The best action (0: up, 1: down, 2: left, 3: right)
     """
-    print("1")
+    #print("1")
     global _GLOBAL_APPROXIMATOR
     
     # Initialize the approximator if it's not already loaded
@@ -393,7 +393,7 @@ def get_action(state, score):
         
         # Create and load the approximator
         _GLOBAL_APPROXIMATOR = SymmetricNTupleApproximator(board_size=4, patterns=patterns)
-        _GLOBAL_APPROXIMATOR.load('ntuple_weights75000.pkl')
+        _GLOBAL_APPROXIMATOR.load('ntuple_weights80000.pkl')
     
     # Create a temporary environment to check legal moves
     env = Game2048Env()
