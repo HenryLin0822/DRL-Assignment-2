@@ -706,7 +706,7 @@ def get_action(state, score):
         
         # Create and load the approximator
         _GLOBAL_APPROXIMATOR = SymmetricNTupleApproximator(board_size=4, patterns=patterns)
-        _GLOBAL_APPROXIMATOR.load('ntuple_weights100000.pkl')
+        _GLOBAL_APPROXIMATOR.load('ntuple_weights_test.pkl')
     
     # Create a temporary environment to check legal moves
     env = Game2048Env()
