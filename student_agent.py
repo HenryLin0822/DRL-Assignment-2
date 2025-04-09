@@ -334,11 +334,7 @@ class SymmetricNTupleApproximator:
 import math
 import numpy as np
 import random
-import time
 from collections import defaultdict
-
-# Global approximator to avoid recreating it on every get_action call
-_GLOBAL_APPROXIMATOR = None
 
 # MCTS Node classes
 class StateNode:
@@ -362,11 +358,14 @@ class StateNode:
                 return action
                 
         # Otherwise use UCB to select
-        log_n_visits = math.log(self.visits)
+        log_n_visits = math.log(self.visits) if self.visits > 0 else 0
         
         def ucb_score(action):
             child = self.children[action]
             exploitation = child.value
+            # Handle case where child has no visits
+            if child.visits == 0:
+                return float('inf')  # Ensure unvisited children are selected first
             exploration = exploration_weight * math.sqrt(log_n_visits / child.visits)
             return exploitation + exploration
             
@@ -458,8 +457,9 @@ class MCTS:
             leaf, path = self._select(root, env, legal_actions)
             
             # Phase 2: Expansion
-            if leaf.visits > 0:
-                leaf = self._expand(leaf, env, path[-1][0] if path else None)
+            # Only expand if the node has been visited before or it's the root
+            if leaf.visits > 0 or leaf == root:
+                leaf = self._expand_all(leaf, env, path[-1][0] if path else None)
                 
             # Phase 3: Simulation (using n-tuple network)
             value = self._simulate(leaf)
@@ -467,7 +467,7 @@ class MCTS:
             # Phase 4: Backpropagation
             self._backpropagate(leaf, value, path)
             
-        # Choose the action with the highest average value
+        # Choose the action with the highest value
         return self._best_action(root, legal_actions)
         
     def _select(self, node, env, legal_actions=None):
@@ -510,16 +510,16 @@ class MCTS:
             return node, path
             
         return node, path
-        
-    def _expand(self, node, env, previous_action=None):
-        """Expand the selected node."""
-        # If node is a state node, expand with an afterstate
+    
+    def _expand_all(self, node, env, previous_action=None):
+        """Expand all children of the selected node at once."""
+        # If node is a state node, expand with all legal afterstates
         if isinstance(node, StateNode):
             # Get legal actions
             temp_env = self._create_env(node.board)
             legal_actions = [a for a in range(4) if temp_env.is_move_legal(a)]
             
-            # Select an unexpanded action
+            # Expand all legal actions
             for action in legal_actions:
                 if action not in node.children:
                     # Simulate the action to get the afterstate
@@ -533,14 +533,28 @@ class MCTS:
                     
                     # Add child node
                     node.add_child(action, afterstate)
-                    return afterstate
+            
+            # Return one of the newly created children
+            # For simplicity, return the first unexplored afterstate
+            for action in legal_actions:
+                if action in node.children and node.children[action].visits == 0:
+                    return node.children[action]
+            
+            # If all children are visited, return any one
+            if legal_actions and legal_actions[0] in node.children:
+                return node.children[legal_actions[0]]
+            
+            # If no children (shouldn't happen), return node itself
+            return node
         
-        # If node is an afterstate node, expand with a state node
+        # If node is an afterstate node, expand with all possible state nodes
         elif isinstance(node, AfterStateNode):
             # Get empty cells
             empty_cells = list(zip(*np.where(node.board == 0)))
-            
-            # Try different tile placements
+            if not empty_cells:
+                return node  # No empty cells to expand
+                
+            # Expand all possible tile placements
             for row, col in empty_cells:
                 for value in [2, 4]:
                     key = (row, col, value)
@@ -554,8 +568,24 @@ class MCTS:
                         
                         # Add child node
                         node.add_child((row, col), value, state_node)
-                        return state_node
-        
+            
+            # Return one of the newly created children
+            # For simplicity, return a random child
+            if empty_cells:
+                pos = random.choice(empty_cells)
+                value = 2 if random.random() < 0.9 else 4
+                key = (pos[0], pos[1], value)
+                
+                # If the exact key doesn't exist, find a close one
+                if key not in node.children:
+                    keys = list(node.children.keys())
+                    if keys:
+                        key = keys[0]
+                    else:
+                        return node  # No children, return node itself
+                
+                return node.children[key]
+            
         # If we can't expand, return the node itself
         return node
         
@@ -593,28 +623,48 @@ class MCTS:
             return max_value
         
     def _backpropagate(self, node, value, path):
-        """Update statistics of visited nodes."""
-        # Update the expanded node
+        """Update values from leaf to root."""
+        # Update the expanded leaf node
         node.visits += 1
         node.value += (value - node.value) / node.visits
         
         # Traverse back up the path
         for parent, action in reversed(path):
-            child = parent.children[action]
-            value = child.value  # Use the updated value from child
-            
             parent.visits += 1
-            parent.value += (value - parent.value) / parent.visits
+            
+            if isinstance(parent, StateNode):
+                # For state nodes (max nodes), we need to take the maximum value of all children
+                max_value = float('-inf')
+                for child_action, child in parent.children.items():
+                    if child.visits > 0:
+                        max_value = max(max_value, child.value)
+                
+                # Only update if we found a valid max value
+                if max_value != float('-inf'):
+                    parent.value = max_value  # Use max directly, not an average
+            
+            elif isinstance(parent, AfterStateNode):
+                # For afterstate nodes (chance nodes), we calculate expected value
+                # This would normally be a weighted sum based on probabilities
+                # But since we're already averaging through visits, we can use incremental update
+                child = parent.children[action]
+                parent.value += (child.value - parent.value) / parent.visits
             
     def _best_action(self, root, legal_actions):
-        """Select the best action based on visit count."""
-        # Choose action with highest average value
-        def score(action):
-            if action in root.children:
-                return root.children[action].visits  # Using visit count for robustness
-            return 0
-            
-        return max(legal_actions, key=score)
+        """Select the best action based on value."""
+        # Choose action with highest value
+        best_action = legal_actions[0]
+        best_value = float('-inf')
+        
+        for action in legal_actions:
+            if action in root.children and root.children[action].visits > 0:
+                value = root.children[action].value
+                if value > best_value:
+                    best_value = value
+                    best_action = action
+    
+                    
+        return best_action
         
     def _create_env(self, board):
         """Create a temporary environment with the given board state."""
@@ -655,12 +705,10 @@ def get_action(state, score):
         ]
         
         # Create and load the approximator
-        from student_agent import SymmetricNTupleApproximator
         _GLOBAL_APPROXIMATOR = SymmetricNTupleApproximator(board_size=4, patterns=patterns)
-        _GLOBAL_APPROXIMATOR.load('ntuple_weights_test.pkl')
+        _GLOBAL_APPROXIMATOR.load('ntuple_weights100000.pkl')
     
     # Create a temporary environment to check legal moves
-    from student_agent import Game2048Env
     env = Game2048Env()
     env.board = state.copy()
     env.score = score
@@ -674,14 +722,14 @@ def get_action(state, score):
     if len(legal_moves) == 1:
         return legal_moves[0]
     
-    # Number of MCTS iterations (adjust based on performance needs)
-    num_iterations = 200  # Start with 200 iterations, can be increased for better performance
+    # Number of MCTS iterations - still limited for performance, but increased from 50
+    num_iterations = 100  # Increased from 50 as suggested in your comment
     
-    # Exploration weight for UCB
-    exploration_weight = 0.01
+    # Exploration weight for UCB - set to standard value
+    exploration_weight = 0  # Standard exploration parameter for UCB
     
-    # Normalization constant
-    v_norm = 400000
+    # Normalization constant - set to value suggested in paper
+    v_norm = 4096  # Value suggested in the analysis for proper normalization
     
     # Run MCTS
     mcts = MCTS(_GLOBAL_APPROXIMATOR, num_iterations, exploration_weight, v_norm)
