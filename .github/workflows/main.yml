@@ -32,8 +32,7 @@ jobs:
     - name: 3. Download checkpoint from Google Drive
       run: |
         # Download the checkpoint file using the file ID
-        gdown --id 1SkTODH2gtJF_MaOu07J-eHhhS5mOnxhL -O ntuple_weights80000.pkl
-        
+        gdown --id 11-JrJFdrJfrVc41vjyuGgfe0im1u2c2b -O ntuple_weights100000.pkl
         # Verify the file was downloaded successfully
         ls -la
 
